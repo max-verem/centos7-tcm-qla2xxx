@@ -1,3 +1,32 @@
+/*******************************************************************************
+ * This file contains tcm implementation using v4 configfs fabric infrastructure
+ * for QLogic target mode HBAs
+ *
+ * Copyright 2010-2011 RisingTide Systems LLC.
+ * Copyright (c)  2011-2016 QLogic Corporation
+ * Copyright (C)  2016-2017 Cavium Inc
+ *
+ * Licensed to the Linux Foundation under the General Public License (GPL)
+ * version 2.
+ *
+ * Author: Nicholas A. Bellinger <nab@risingtidesystems.com>
+ *
+ * tcm_qla2xxx_parse_wwn() and tcm_qla2xxx_format_wwn() contains code from
+ * the TCM_FC / Open-FCoE.org fabric module.
+ *
+ * Copyright (c) 2010 Cisco Systems, Inc
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ ****************************************************************************/
+
 #include <target/target_core_base.h>
 #include <linux/btree.h>
 
@@ -32,6 +61,7 @@ struct tcm_qla2xxx_tpg_attrib {
 	int demo_mode_write_protect;
 	int prod_mode_write_protect;
 	int demo_mode_login_only;
+	int fabric_prot_type;
 	int jam_host;
 };
 
