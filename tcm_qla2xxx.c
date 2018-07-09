@@ -245,6 +245,14 @@ static int tcm_qla2xxx_check_demo_mode_login_only(struct se_portal_group *se_tpg
 	return tpg->tpg_attrib.demo_mode_login_only;
 }
 
+static int tcm_qla2xxx_check_prot_fabric_only(struct se_portal_group *se_tpg)
+{
+	struct tcm_qla2xxx_tpg *tpg = container_of(se_tpg,
+				struct tcm_qla2xxx_tpg, se_tpg);
+
+	return tpg->tpg_attrib.fabric_prot_type;
+}
+
 static u32 tcm_qla2xxx_tpg_get_inst_index(struct se_portal_group *se_tpg)
 {
 	struct tcm_qla2xxx_tpg *tpg = container_of(se_tpg,
@@ -350,7 +358,6 @@ static int tcm_qla2xxx_shutdown_session(struct se_session *se_sess)
 
 	return 1;
 }
-
 static void tcm_qla2xxx_release_session(struct kref *kref)
 {
 	struct fc_port  *sess = container_of(kref,
@@ -887,7 +894,6 @@ DEF_QLA_TPG_ATTRIB(cache_dynamic_acls);
 DEF_QLA_TPG_ATTRIB(demo_mode_write_protect);
 DEF_QLA_TPG_ATTRIB(prod_mode_write_protect);
 DEF_QLA_TPG_ATTRIB(demo_mode_login_only);
-
 #ifdef CONFIG_TCM_QLA2XXX_DEBUG
 DEF_QLA_TPG_ATTRIB(jam_host);
 #endif
@@ -993,6 +999,7 @@ static ssize_t tcm_qla2xxx_tpg_dynamic_sessions_show(struct config_item *item,
 {
 	return target_show_dynamic_sessions(to_tpg(item), page);
 }
+
 static ssize_t tcm_qla2xxx_tpg_fabric_prot_type_store(struct config_item *item,
 		const char *page, size_t count)
 {
@@ -1001,6 +1008,7 @@ static ssize_t tcm_qla2xxx_tpg_fabric_prot_type_store(struct config_item *item,
 				struct tcm_qla2xxx_tpg, se_tpg);
 	unsigned long val;
 	int ret = kstrtoul(page, 0, &val);
+
 	if (ret) {
 		pr_err("kstrtoul() returned %d for fabric_prot_type\n", ret);
 		return ret;
@@ -1153,8 +1161,8 @@ static ssize_t tcm_qla2xxx_npiv_tpg_enable_store(struct config_item *item,
 CONFIGFS_ATTR(tcm_qla2xxx_npiv_tpg_, enable);
 
 static struct configfs_attribute *tcm_qla2xxx_npiv_tpg_attrs[] = {
-	&tcm_qla2xxx_npiv_tpg_attr_enable,
-	NULL,
+        &tcm_qla2xxx_npiv_tpg_attr_enable,
+        NULL,
 };
 
 static struct se_portal_group *tcm_qla2xxx_npiv_make_tpg(
@@ -1454,6 +1462,7 @@ static void tcm_qla2xxx_free_session(struct fc_port *sess)
 	transport_deregister_session_configfs(sess->se_sess);
 	transport_deregister_session(sess->se_sess);
 }
+
 static int tcm_qla2xxx_session_cb(struct se_portal_group *se_tpg,
 				  struct se_session *se_sess, void *p)
 {
@@ -1468,15 +1477,22 @@ static int tcm_qla2xxx_session_cb(struct se_portal_group *se_tpg,
 	uint16_t loop_id = qlat_sess->loop_id;
 	unsigned long flags;
 	unsigned char be_sid[3];
+
 	be_sid[0] = qlat_sess->d_id.b.domain;
 	be_sid[1] = qlat_sess->d_id.b.area;
 	be_sid[2] = qlat_sess->d_id.b.al_pa;
+
+	/*
+	 * And now setup se_nacl and session pointers into HW lport internal
+	 * mappings for fabric S_ID and LOOP_ID.
+	 */
 	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
 	tcm_qla2xxx_set_sess_by_s_id(lport, se_nacl, nacl,
 				     se_sess, qlat_sess, be_sid);
 	tcm_qla2xxx_set_sess_by_loop_id(lport, se_nacl, nacl,
 					se_sess, qlat_sess, loop_id);
 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+
 	return 0;
 }
 
@@ -1883,7 +1899,8 @@ static const struct target_core_fabric_ops tcm_qla2xxx_ops = {
 	.tpg_check_demo_mode_write_protect =
 					tcm_qla2xxx_check_demo_write_protect,
 	.tpg_check_prod_mode_write_protect =
-	    tcm_qla2xxx_check_prod_write_protect,
+					tcm_qla2xxx_check_prod_write_protect,
+	.tpg_check_prot_fabric_only	= tcm_qla2xxx_check_prot_fabric_only,
 	.tpg_check_demo_mode_login_only = tcm_qla2xxx_check_demo_mode_login_only,
 	.tpg_get_inst_index		= tcm_qla2xxx_tpg_get_inst_index,
 	.check_stop_free		= tcm_qla2xxx_check_stop_free,
@@ -1953,8 +1970,8 @@ static const struct target_core_fabric_ops tcm_qla2xxx_npiv_ops = {
 	.fabric_drop_tpg		= tcm_qla2xxx_drop_tpg,
 	.fabric_init_nodeacl		= tcm_qla2xxx_init_nodeacl,
 
-	.tfc_wwn_attrs                  = tcm_qla2xxx_wwn_attrs,
-	.tfc_tpg_base_attrs             = tcm_qla2xxx_npiv_tpg_attrs,
+	.tfc_wwn_attrs			= tcm_qla2xxx_wwn_attrs,
+	.tfc_tpg_base_attrs		= tcm_qla2xxx_npiv_tpg_attrs,
 };
 
 static int tcm_qla2xxx_register_configfs(void)
@@ -1970,7 +1987,7 @@ static int tcm_qla2xxx_register_configfs(void)
 		return ret;
 
 	ret = target_register_template(&tcm_qla2xxx_npiv_ops);
-	if(ret)
+	if (ret)
 		goto out_fabric;
 
 	tcm_qla2xxx_free_wq = alloc_workqueue("tcm_qla2xxx_free",
