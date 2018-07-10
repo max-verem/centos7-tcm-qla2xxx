@@ -11,6 +11,7 @@
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
+#include <linux/bsg-lib.h>
 
 static int qla24xx_vport_disable(struct fc_vport *, bool);
 
@@ -731,7 +732,6 @@ qla2x00_issue_logo(struct file *filp, struct kobject *kobj,
 	struct scsi_qla_host *vha = shost_priv(dev_to_shost(container_of(kobj,
 	    struct device, kobj)));
 	int type;
-	int rval = 0;
 	port_id_t did;
 
 	type = simple_strtol(buf, NULL, 10);
@@ -745,7 +745,7 @@ qla2x00_issue_logo(struct file *filp, struct kobject *kobj,
 
 	ql_log(ql_log_info, vha, 0x70e4, "%s: %d\n", __func__, type);
 
-	rval = qla24xx_els_dcmd_iocb(vha, ELS_DCMD_LOGO, did);
+	qla24xx_els_dcmd_iocb(vha, ELS_DCMD_LOGO, did);
 	return count;
 }
 
@@ -900,7 +900,7 @@ qla2x00_alloc_sysfs_attr(scsi_qla_host_t *vha)
 			    iter->name, ret);
 		else
 			ql_dbg(ql_dbg_init, vha, 0x00f4,
-			    "Successfully created sysfs %s binary attribure.\n",
+			    "Successfully created sysfs %s binary attribute.\n",
 			    iter->name);
 	}
 }
@@ -1482,6 +1482,38 @@ qla2x00_pep_version_show(struct device *dev, struct device_attribute *attr,
 	    ha->pep_version[0], ha->pep_version[1], ha->pep_version[2]);
 }
 
+static ssize_t
+qla2x00_min_link_speed_show(struct device *dev, struct device_attribute *attr,
+    char *buf)
+{
+	scsi_qla_host_t *vha = shost_priv(class_to_shost(dev));
+	struct qla_hw_data *ha = vha->hw;
+
+	if (!IS_QLA27XX(ha))
+		return scnprintf(buf, PAGE_SIZE, "\n");
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+	    ha->min_link_speed == 5 ? "32Gps" :
+	    ha->min_link_speed == 4 ? "16Gps" :
+	    ha->min_link_speed == 3 ? "8Gps" :
+	    ha->min_link_speed == 2 ? "4Gps" :
+	    ha->min_link_speed != 0 ? "unknown" : "");
+}
+
+static ssize_t
+qla2x00_max_speed_sup_show(struct device *dev, struct device_attribute *attr,
+    char *buf)
+{
+	scsi_qla_host_t *vha = shost_priv(class_to_shost(dev));
+	struct qla_hw_data *ha = vha->hw;
+
+	if (!IS_QLA27XX(ha))
+		return scnprintf(buf, PAGE_SIZE, "\n");
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+	    ha->max_speed_sup ? "32Gps" : "16Gps");
+}
+
 static DEVICE_ATTR(driver_version, S_IRUGO, qla2x00_drvr_version_show, NULL);
 static DEVICE_ATTR(fw_version, S_IRUGO, qla2x00_fw_version_show, NULL);
 static DEVICE_ATTR(serial_num, S_IRUGO, qla2x00_serial_num_show, NULL);
@@ -1527,6 +1559,8 @@ static DEVICE_ATTR(allow_cna_fw_dump, S_IRUGO | S_IWUSR,
 		   qla2x00_allow_cna_fw_dump_show,
 		   qla2x00_allow_cna_fw_dump_store);
 static DEVICE_ATTR(pep_version, S_IRUGO, qla2x00_pep_version_show, NULL);
+static DEVICE_ATTR(min_link_speed, S_IRUGO, qla2x00_min_link_speed_show, NULL);
+static DEVICE_ATTR(max_speed_sup, S_IRUGO, qla2x00_max_speed_sup_show, NULL);
 
 struct device_attribute *qla2x00_host_attrs[] = {
 	&dev_attr_driver_version,
@@ -1561,6 +1595,8 @@ struct device_attribute *qla2x00_host_attrs[] = {
 	&dev_attr_fw_dump_size,
 	&dev_attr_allow_cna_fw_dump,
 	&dev_attr_pep_version,
+	&dev_attr_min_link_speed,
+	&dev_attr_max_speed_sup,
 	NULL,
 };
 
@@ -1808,14 +1844,13 @@ qla2x00_get_fc_host_stats(struct Scsi_Host *shost)
 	if (qla2x00_reset_active(vha))
 		goto done;
 
-	stats = dma_alloc_coherent(&ha->pdev->dev,
-	    sizeof(*stats), &stats_dma, GFP_KERNEL);
+	stats = dma_zalloc_coherent(&ha->pdev->dev, sizeof(*stats),
+				    &stats_dma, GFP_KERNEL);
 	if (!stats) {
 		ql_log(ql_log_warn, vha, 0x707d,
 		    "Failed to allocate memory for stats.\n");
 		goto done;
 	}
-	memset(stats, 0, sizeof(*stats));
 
 	rval = QLA_FUNCTION_FAILED;
 	if (IS_FWI2_CAPABLE(ha)) {
@@ -2067,7 +2102,7 @@ qla24xx_vport_create(struct fc_vport *fc_vport, bool disable)
 	}
 
 	if (qos) {
-		qpair = qla2xxx_create_qpair(vha, 0, qos, vha->vp_idx, true);
+		qpair = qla2xxx_create_qpair(vha, qos, vha->vp_idx, true);
 		if (!qpair)
 			ql_log(ql_log_warn, vha, 0x7084,
 			    "Can't create qpair for VP[%d]\n",
@@ -2135,6 +2170,8 @@ qla24xx_vport_delete(struct fc_vport *fc_vport)
 	dma_free_coherent(&ha->pdev->dev, vha->gnl.size, vha->gnl.l,
 	    vha->gnl.ldma);
 
+	vfree(vha->scan.l);
+
 	if (vha->qpair && vha->qpair->vp_idx == vha->vp_idx) {
 		if (qla2xxx_delete_qpair(vha, vha->qpair) != QLA_SUCCESS)
 			ql_log(ql_log_warn, vha, 0x7087,
@@ -2157,6 +2194,48 @@ qla24xx_vport_disable(struct fc_vport *fc_vport, bool disable)
 		qla24xx_enable_vp(vha);
 
 	return 0;
+}
+
+static int
+__qla24xx_bsg_request(struct fc_bsg_job *bsg_job)
+{
+    struct bsg_job job;
+    job.dev = bsg_job->dev;
+    job.req = bsg_job->req;
+    job.request = bsg_job->request;
+    job.reply = bsg_job->reply;
+    job.request_len = bsg_job->request_len;
+    job.reply_len = bsg_job->reply_len;
+    job.request_payload.payload_len = bsg_job->request_payload.payload_len;
+    job.request_payload.sg_cnt = bsg_job->request_payload.sg_cnt;
+    job.request_payload.sg_list = bsg_job->request_payload.sg_list;
+    job.reply_payload.payload_len = bsg_job->reply_payload.payload_len;
+    job.reply_payload.sg_cnt = bsg_job->reply_payload.sg_cnt;
+    job.reply_payload.sg_list = bsg_job->reply_payload.sg_list;
+    job.dd_data = bsg_job->dd_data;
+    
+    return qla24xx_bsg_request(&job);
+}
+
+static int
+__qla24xx_bsg_timeout(struct fc_bsg_job *bsg_job)
+{
+    struct bsg_job job;
+    job.dev = bsg_job->dev;
+    job.req = bsg_job->req;
+    job.request = bsg_job->request;
+    job.reply = bsg_job->reply;
+    job.request_len = bsg_job->request_len;
+    job.reply_len = bsg_job->reply_len;
+    job.request_payload.payload_len = bsg_job->request_payload.payload_len;
+    job.request_payload.sg_cnt = bsg_job->request_payload.sg_cnt;
+    job.request_payload.sg_list = bsg_job->request_payload.sg_list;
+    job.reply_payload.payload_len = bsg_job->reply_payload.payload_len;
+    job.reply_payload.sg_cnt = bsg_job->reply_payload.sg_cnt;
+    job.reply_payload.sg_list = bsg_job->reply_payload.sg_list;
+    job.dd_data = bsg_job->dd_data;
+    
+    return qla24xx_bsg_timeout(&job);
 }
 
 struct fc_function_template qla2xxx_transport_functions = {
@@ -2203,8 +2282,8 @@ struct fc_function_template qla2xxx_transport_functions = {
 	.vport_create = qla24xx_vport_create,
 	.vport_disable = qla24xx_vport_disable,
 	.vport_delete = qla24xx_vport_delete,
-	.bsg_request = qla24xx_bsg_request,
-	.bsg_timeout = qla24xx_bsg_timeout,
+	.bsg_request = __qla24xx_bsg_request,
+	.bsg_timeout = __qla24xx_bsg_timeout,
 };
 
 struct fc_function_template qla2xxx_transport_vport_functions = {
@@ -2247,8 +2326,8 @@ struct fc_function_template qla2xxx_transport_vport_functions = {
 	.get_fc_host_stats = qla2x00_get_fc_host_stats,
 	.reset_fc_host_stats = qla2x00_reset_host_stats,
 
-	.bsg_request = qla24xx_bsg_request,
-	.bsg_timeout = qla24xx_bsg_timeout,
+	.bsg_request = __qla24xx_bsg_request,
+	.bsg_timeout = __qla24xx_bsg_timeout,
 };
 
 void

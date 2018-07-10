@@ -6,9 +6,11 @@
  */
 #include "qla_def.h"
 #include <linux/delay.h>
+#include <linux/ktime.h>
 #include <linux/pci.h>
 #include <linux/ratelimit.h>
 #include <linux/vmalloc.h>
+#include <linux/bsg-lib.h>
 #include <scsi/scsi_tcq.h>
 #include <linux/utsname.h>
 
@@ -488,7 +490,7 @@ qlafx00_mbx_reg_test(scsi_qla_host_t *vha)
 
 /**
  * qlafx00_pci_config() - Setup ISPFx00 PCI configuration registers.
- * @ha: HA context
+ * @vha: HA context
  *
  * Returns 0 on success.
  */
@@ -517,9 +519,9 @@ qlafx00_pci_config(scsi_qla_host_t *vha)
 
 /**
  * qlafx00_warm_reset() - Perform warm reset of iSA(CPUs being reset on SOC).
- * @ha: HA context
+ * @vha: HA context
  *
-  */
+ */
 static inline void
 qlafx00_soc_cpu_reset(scsi_qla_host_t *vha)
 {
@@ -623,7 +625,7 @@ qlafx00_soc_cpu_reset(scsi_qla_host_t *vha)
 
 /**
  * qlafx00_soft_reset() - Soft Reset ISPFx00.
- * @ha: HA context
+ * @vha: HA context
  *
  * Returns 0 on success.
  */
@@ -642,7 +644,7 @@ qlafx00_soft_reset(scsi_qla_host_t *vha)
 
 /**
  * qlafx00_chip_diag() - Test ISPFx00 for proper operation.
- * @ha: HA context
+ * @vha: HA context
  *
  * Returns 0 on success.
  */
@@ -726,13 +728,13 @@ qlafx00_disable_intrs(struct qla_hw_data *ha)
 }
 
 int
-qlafx00_abort_target(fc_port_t *fcport, unsigned int l, int tag)
+qlafx00_abort_target(fc_port_t *fcport, uint64_t l, int tag)
 {
 	return qla2x00_async_tm_cmd(fcport, TCF_TARGET_RESET, l, tag);
 }
 
 int
-qlafx00_lun_reset(fc_port_t *fcport, unsigned int l, int tag)
+qlafx00_lun_reset(fc_port_t *fcport, uint64_t l, int tag)
 {
 	return qla2x00_async_tm_cmd(fcport, TCF_LUN_RESET, l, tag);
 }
@@ -1406,7 +1408,7 @@ qlafx00_abort_isp_cleanup(scsi_qla_host_t *vha, bool critemp)
 
 /**
  * qlafx00_init_response_q_entries() - Initializes response queue entries.
- * @ha: HA context
+ * @rsp: response queue
  *
  * Beginning of request ring has initialization control block already built
  * by nvram config routine.
@@ -1820,9 +1822,11 @@ qlafx00_fx_disc(scsi_qla_host_t *vha, fc_port_t *fcport, uint16_t fx_type)
 
 	sp->type = SRB_FXIOCB_DCMD;
 	sp->name = "fxdisc";
-	qla2x00_init_timer(sp, FXDISC_TIMEOUT);
 
 	fdisc = &sp->u.iocb_cmd;
+	fdisc->timeout = qla2x00_fxdisc_iocb_timeout;
+	qla2x00_init_timer(sp, FXDISC_TIMEOUT);
+
 	switch (fx_type) {
 	case FXDISC_GET_CONFIG_INFO:
 	fdisc->u.fxiocb.flags =
@@ -1852,7 +1856,7 @@ qlafx00_fx_disc(scsi_qla_host_t *vha, fc_port_t *fcport, uint16_t fx_type)
 		p_sysid = utsname();
 		if (!p_sysid) {
 			ql_log(ql_log_warn, vha, 0x303c,
-			    "Not able to get the system informtion\n");
+			    "Not able to get the system information\n");
 			goto done_free_sp;
 		}
 		break;
@@ -1924,7 +1928,6 @@ qlafx00_fx_disc(scsi_qla_host_t *vha, fc_port_t *fcport, uint16_t fx_type)
 			goto done_unmap_req;
 	}
 
-	fdisc->timeout = qla2x00_fxdisc_iocb_timeout;
 	fdisc->u.fxiocb.req_func_type = cpu_to_le16(fx_type);
 	sp->done = qla2x00_fxdisc_sp_done;
 
@@ -2162,7 +2165,7 @@ qlafx00_handle_sense(srb_t *sp, uint8_t *sense_data, uint32_t par_sense_len,
 
 	if (sense_len) {
 		ql_dbg(ql_dbg_io + ql_dbg_buffer, vha, 0x3039,
-		    "Check condition Sense data, nexus%ld:%d:%d cmd=%p.\n",
+		    "Check condition Sense data, nexus%ld:%d:%llu cmd=%p.\n",
 		    sp->vha->host_no, cp->device->id, cp->device->lun,
 		    cp);
 		ql_dump_buffer(ql_dbg_io + ql_dbg_buffer, vha, 0x3049,
@@ -2208,7 +2211,8 @@ qlafx00_ioctl_iosb_entry(scsi_qla_host_t *vha, struct req_que *req,
 {
 	const char func[] = "IOSB_IOCB";
 	srb_t *sp;
-	struct fc_bsg_job *bsg_job;
+	struct bsg_job *bsg_job;
+	struct fc_bsg_reply *bsg_reply;
 	struct srb_iocb *iocb_job;
 	int res;
 	struct qla_mt_iocb_rsp_fx00 fstatus;
@@ -2228,6 +2232,7 @@ qlafx00_ioctl_iosb_entry(scsi_qla_host_t *vha, struct req_que *req,
 			    pkt->dataword_r;
 	} else {
 		bsg_job = sp->u.bsg_job;
+		bsg_reply = bsg_job->reply;
 
 		memset(&fstatus, 0, sizeof(struct qla_mt_iocb_rsp_fx00));
 
@@ -2236,16 +2241,14 @@ qlafx00_ioctl_iosb_entry(scsi_qla_host_t *vha, struct req_que *req,
 		fstatus.ioctl_flags = pkt->fw_iotcl_flags;
 		fstatus.ioctl_data = pkt->dataword_r;
 		fstatus.adapid = pkt->adapid;
-		fstatus.adapid_hi = pkt->adapid_hi;
-		fstatus.reserved_2 = pkt->reserved_1;
+		fstatus.reserved_2 = pkt->dataword_r_extra;
 		fstatus.res_count = pkt->residuallen;
 		fstatus.status = pkt->status;
 		fstatus.seq_number = pkt->seq_no;
 		memcpy(fstatus.reserved_3,
 		    pkt->reserved_2, 20 * sizeof(uint8_t));
 
-		fw_sts_ptr = ((uint8_t *)bsg_job->req->sense) +
-		    sizeof(struct fc_bsg_reply);
+		fw_sts_ptr = bsg_job->reply + sizeof(struct fc_bsg_reply);
 
 		memcpy(fw_sts_ptr, (uint8_t *)&fstatus,
 		    sizeof(struct qla_mt_iocb_rsp_fx00));
@@ -2260,8 +2263,8 @@ qlafx00_ioctl_iosb_entry(scsi_qla_host_t *vha, struct req_que *req,
 		    sp->fcport->vha, 0x5074,
 		    (uint8_t *)fw_sts_ptr, sizeof(struct qla_mt_iocb_rsp_fx00));
 
-		res = bsg_job->reply->result = DID_OK << 16;
-		bsg_job->reply->reply_payload_rcv_len =
+		res = bsg_reply->result = DID_OK << 16;
+		bsg_reply->reply_payload_rcv_len =
 		    bsg_job->reply_payload.payload_len;
 	}
 	sp->done(sp, res);
@@ -2269,7 +2272,8 @@ qlafx00_ioctl_iosb_entry(scsi_qla_host_t *vha, struct req_que *req,
 
 /**
  * qlafx00_status_entry() - Process a Status IOCB entry.
- * @ha: SCSI driver HA context
+ * @vha: SCSI driver HA context
+ * @rsp: response queue
  * @pkt: Entry pointer
  */
 static void
@@ -2304,12 +2308,10 @@ qlafx00_status_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, void *pkt)
 	req = ha->req_q_map[que];
 
 	/* Validate handle. */
-	if (handle < req->num_outstanding_cmds) {
-		gmb();
+	if (handle < req->num_outstanding_cmds)
 		sp = req->outstanding_cmds[handle];
-	} else {
+	else
 		sp = NULL;
-	}
 
 	if (sp == NULL) {
 		ql_dbg(ql_dbg_io, vha, 0x3034,
@@ -2528,7 +2530,7 @@ check_scsi_status:
 
 	if (logit)
 		ql_dbg(ql_dbg_io, fcport->vha, 0x3058,
-		    "FCP command status: 0x%x-0x%x (0x%x) nexus=%ld:%d:%d "
+		    "FCP command status: 0x%x-0x%x (0x%x) nexus=%ld:%d:%llu "
 		    "tgt_id: 0x%x lscsi_status: 0x%x cdb=%10phN len=0x%x "
 		    "rsp_info=%p resid=0x%x fw_resid=0x%x sense_len=0x%x, "
 		    "par_sense_len=0x%x, rsp_info_len=0x%x\n",
@@ -2544,7 +2546,7 @@ check_scsi_status:
 
 /**
  * qlafx00_status_cont_entry() - Process a Status Continuations entry.
- * @ha: SCSI driver HA context
+ * @rsp: response queue
  * @pkt: Entry pointer
  *
  * Extended sense data.
@@ -2622,7 +2624,9 @@ qlafx00_status_cont_entry(struct rsp_que *rsp, sts_cont_entry_t *pkt)
 
 /**
  * qlafx00_multistatus_entry() - Process Multi response queue entries.
- * @ha: SCSI driver HA context
+ * @vha: SCSI driver HA context
+ * @rsp: response queue
+ * @pkt:
  */
 static void
 qlafx00_multistatus_entry(struct scsi_qla_host *vha,
@@ -2657,12 +2661,10 @@ qlafx00_multistatus_entry(struct scsi_qla_host *vha,
 		req = ha->req_q_map[que];
 
 		/* Validate handle. */
-		if (handle < req->num_outstanding_cmds) {
-			gmb();
+		if (handle < req->num_outstanding_cmds)
 			sp = req->outstanding_cmds[handle];
-		} else {
+		else
 			sp = NULL;
-		}
 
 		if (sp == NULL) {
 			ql_dbg(ql_dbg_io, vha, 0x3044,
@@ -2678,8 +2680,11 @@ qlafx00_multistatus_entry(struct scsi_qla_host *vha,
 
 /**
  * qlafx00_error_entry() - Process an error entry.
- * @ha: SCSI driver HA context
+ * @vha: SCSI driver HA context
+ * @rsp: response queue
  * @pkt: Entry pointer
+ * @estatus:
+ * @etype:
  */
 static void
 qlafx00_error_entry(scsi_qla_host_t *vha, struct rsp_que *rsp,
@@ -2709,7 +2714,8 @@ qlafx00_error_entry(scsi_qla_host_t *vha, struct rsp_que *rsp,
 
 /**
  * qlafx00_process_response_queue() - Process response queue entries.
- * @ha: SCSI driver HA context
+ * @vha: SCSI driver HA context
+ * @rsp: response queue
  */
 static void
 qlafx00_process_response_queue(struct scsi_qla_host *vha,
@@ -2785,7 +2791,7 @@ qlafx00_process_response_queue(struct scsi_qla_host *vha,
 
 /**
  * qlafx00_async_event() - Process aynchronous events.
- * @ha: SCSI driver HA context
+ * @vha: SCSI driver HA context
  */
 static void
 qlafx00_async_event(scsi_qla_host_t *vha)
@@ -2861,10 +2867,9 @@ qlafx00_async_event(scsi_qla_host_t *vha)
 }
 
 /**
- *
  * qlafx00x_mbx_completion() - Process mailbox command completions.
- * @ha: SCSI driver HA context
- * @mb16: Mailbox16 register
+ * @vha: SCSI driver HA context
+ * @mb0:
  */
 static void
 qlafx00_mbx_completion(scsi_qla_host_t *vha, uint32_t mb0)
@@ -2932,7 +2937,8 @@ qlafx00_intr_handler(int irq, void *dev_id)
 		stat = QLAFX00_RD_INTR_REG(ha);
 		if (qla2x00_check_reg32_for_disconnect(vha, stat))
 			break;
-		if ((stat & QLAFX00_HST_INT_STS_BITS) == 0)
+		intr_stat = stat & QLAFX00_HST_INT_STS_BITS;
+		if (!intr_stat)
 			break;
 
 		if (stat & QLAFX00_INTR_MB_CMPLT) {
@@ -3089,7 +3095,6 @@ qlafx00_start_scsi(srb_t *sp)
 	struct cmd_type_7_fx00 *cmd_pkt;
 	struct cmd_type_7_fx00 lcmd_pkt;
 	struct scsi_lun llun;
-	char		tag[2];
 
 	/* Setup device pointers. */
 	rsp = ha->rsp_q_map[0];
@@ -3148,25 +3153,15 @@ qlafx00_start_scsi(srb_t *sp)
 	memset(&lcmd_pkt, 0, REQUEST_ENTRY_SIZE);
 
 	lcmd_pkt.handle = MAKE_HANDLE(req->id, sp->handle);
-	lcmd_pkt.handle_hi = 0;
+	lcmd_pkt.reserved_0 = 0;
+	lcmd_pkt.port_path_ctrl = 0;
+	lcmd_pkt.reserved_1 = 0;
 	lcmd_pkt.dseg_count = cpu_to_le16(tot_dsds);
 	lcmd_pkt.tgt_idx = cpu_to_le16(sp->fcport->tgt_id);
 
 	int_to_scsilun(cmd->device->lun, &llun);
 	host_to_adap((uint8_t *)&llun, (uint8_t *)&lcmd_pkt.lun,
 	    sizeof(lcmd_pkt.lun));
-
-	/* Update tagged queuing modifier -- default is TSK_SIMPLE (0). */
-	if (scsi_populate_tag_msg(cmd, tag)) {
-		switch (tag[0]) {
-		case HEAD_OF_QUEUE_TAG:
-			lcmd_pkt.task = TSK_HEAD_OF_QUEUE;
-			break;
-		case ORDERED_QUEUE_TAG:
-			lcmd_pkt.task = TSK_ORDERED;
-			break;
-		}
-	}
 
 	/* Load SCSI command packet. */
 	host_to_adap(cmd->cmnd, lcmd_pkt.fcp_cdb, sizeof(lcmd_pkt.fcp_cdb));
@@ -3228,8 +3223,7 @@ qlafx00_tm_iocb(srb_t *sp, struct tsk_mgmt_entry_fx00 *ptm_iocb)
 	tm_iocb.entry_type = TSK_MGMT_IOCB_TYPE_FX00;
 	tm_iocb.entry_count = 1;
 	tm_iocb.handle = cpu_to_le32(MAKE_HANDLE(req->id, sp->handle));
-	tm_iocb.handle_hi = 0;
-	tm_iocb.timeout = cpu_to_le16(qla2x00_get_async_timeout(vha) + 2);
+	tm_iocb.reserved_0 = 0;
 	tm_iocb.tgt_id = cpu_to_le16(sp->fcport->tgt_id);
 	tm_iocb.control_flags = cpu_to_le32(fxio->u.tmf.flags);
 	if (tm_iocb.control_flags == cpu_to_le32((uint32_t)TCF_LUN_RESET)) {
@@ -3270,7 +3264,8 @@ qlafx00_fxdisc_iocb(srb_t *sp, struct fxdisc_entry_fx00 *pfxiocb)
 {
 	struct srb_iocb *fxio = &sp->u.iocb_cmd;
 	struct qla_mt_iocb_rqst_fx00 *piocb_rqst;
-	struct fc_bsg_job *bsg_job;
+	struct bsg_job *bsg_job;
+	struct fc_bsg_request *bsg_request;
 	struct fxdisc_entry_fx00 fx_iocb;
 	uint8_t entry_cnt = 1;
 
@@ -3319,8 +3314,9 @@ qlafx00_fxdisc_iocb(srb_t *sp, struct fxdisc_entry_fx00 *pfxiocb)
 	} else {
 		struct scatterlist *sg;
 		bsg_job = sp->u.bsg_job;
+		bsg_request = bsg_job->request;
 		piocb_rqst = (struct qla_mt_iocb_rqst_fx00 *)
-			&bsg_job->request->rqst_data.h_vendor.vendor_cmd[1];
+			&bsg_request->rqst_data.h_vendor.vendor_cmd[1];
 
 		fx_iocb.func_num = piocb_rqst->func_type;
 		fx_iocb.adapid = piocb_rqst->adapid;
